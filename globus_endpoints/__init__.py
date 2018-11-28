@@ -3,11 +3,15 @@ import datetime
 import globus_sdk
 import json
 import posixpath
+import requests
 from girder import events, plugin
 from girder.api import access, rest
 from girder.constants import AccessType
+from girder.exceptions import RestException
 from girder.models.user import User
 from girder_oauth.providers import Globus
+
+_DOWNLOAD_URL = 'https://dabdceba-6d04-11e5-ba46-22000b92c6ec.e.globus.org/Girder/FSNTOA_000101_050012.nc'
 
 
 def _globusFolder(id, name, path):
@@ -55,8 +59,6 @@ def _globusTc(user):
     authorizer = globus_sdk.AccessTokenAuthorizer(user['globusToken'])
     return globus_sdk.TransferClient(authorizer=authorizer)
 
-globus_sdk.TransferData
-
 
 @access.public
 @rest.boundHandler
@@ -64,7 +66,7 @@ def _globusChildFolders(self, event):
     params = event.info['params']
     user = self.getCurrentUser()
 
-    if 'parentId' not in params or 'globusToken' not in user:
+    if not user or 'parentId' not in params or 'globusToken' not in user:
         return  # This is not a child listing request
 
     if params['parentId'].startswith('globus:'):
@@ -77,9 +79,9 @@ def _globusChildFolders(self, event):
     elif user and str(user['_id']) == params['parentId'] and 'globusToken' in user:
         # We're listing our own user folders, so we append globus endpoints
         tc = _globusTc(user)
-        endpoints = [_endpointFolder(ep) for ep in tc.endpoint_search(filter_scope='my-endpoints')]
+        eps = [_endpointFolder(ep) for ep in tc.endpoint_search(filter_scope='shared-with-me')]  # TODO could also be 'my-endpoints'
         # TODO this overrides core behavior, we need to add the normal folders back in!
-        event.preventDefault().addResponse(endpoints)
+        event.preventDefault().addResponse(eps)
 
 
 @access.public
@@ -88,8 +90,8 @@ def _globusChildItems(self, event):
     params = event.info['params']
     user = self.getCurrentUser()
 
-    if 'folderId' not in params or 'globusToken' not in user:
-        return  # This is not a child listing request
+    if not user or 'folderId' not in params or 'globusToken' not in user:
+        return
 
     if params['folderId'].startswith('globus:'):
         info = json.loads(base64.b64decode(params['folderId'][7:]))
@@ -171,9 +173,24 @@ def _globusFileDownload(self, event):
     if not event.info['id'].startswith('globus:'):
         return
 
-    tc = _globusTc(self.getCurrentUser())
+    info = json.loads(base64.b64decode(event.info['id'][7:]))
+    path = info['path'][2:]  # TODO this strips the leading '~/', might need to be more robust
+    r = requests.get(
+        'https://%s.e.globus.org/%s' % (info['id'], path), stream=True, headers={
+            'Authorization': 'Bearer ' + self.getCurrentUser()['globusToken']
+        })
+    try:
+        r.raise_for_status()
+    except requests.RequestException:
+        raise RestException(
+            'Invalid response from Globus HTTPS download service (%s).' % r.status_code, code=502)
+
+    rest.setResponseHeader('Content-Length', r.headers['Content-Length'])
+    rest.setResponseHeader('Content-Type', r.headers['Content-Type'])
+
     def stream():
-        pass  # TODO how do we download a file??
+        for chunk in r.iter_content(65536):
+            yield chunk
 
     event.preventDefault().addResponse(stream)
 
@@ -181,28 +198,39 @@ def _globusFileDownload(self, event):
 def _saveGlobusToken(event):
     # When a user logs in with globus, we save their token
     if event.info['provider'] == Globus:
+        transferToken = None
+        downloadToken = None
+        import pprint; pprint.pprint(event.info['token'])  # TODO delete
         for other in event.info['token']['other_tokens']:
             if other.get('resource_server') == 'transfer.api.globus.org':
-                User().update({
-                    '_id': event.info['user']['_id']
-                }, {
-                    '$set': {'globusToken': other['access_token']}
-                }, multi=False)
-                break
+                transferToken = other['access_token']
+            if other.get('resource_server') == 'e.globus.org':  # TODO is this right?
+                downloadToken = other['access_token']
+
+        User().update({
+            '_id': event.info['user']['_id']
+        }, {
+            '$set': {
+                'globusTransferToken': transferToken,
+                'globusDownloadtoken': downloadToken
+            }
+        }, multi=False)
 
 
 class GirderPlugin(plugin.GirderPlugin):
     DISPLAY_NAME = 'Globus endpoints'
 
     def load(self, info):
+        plugin.getPlugin('oauth').load(info)
+
         name = 'globus_endpoints'
         events.bind('rest.get.item.before', name, _globusChildItems)
-        events.bind('rest.get.file/:id/download', name, _globusFileDownload)
+        events.bind('rest.get.file/:id/download.before', name, _globusFileDownload)
         events.bind('rest.get.folder.before', name, _globusChildFolders)
         events.bind('rest.get.folder/:id.before', name, _globusFolderInfo)
         events.bind('rest.get.folder/:id/details.before', name, _globusFolderDetails)
         events.bind('rest.get.item/:id.before', name, _globusItemInfo)
-        events.bind('rest.get.item/:id/download', name, _globusFileDownload)
+        events.bind('rest.get.item/:id/download.before', name, _globusFileDownload)
         events.bind('rest.get.item/:id/files.before', name, _globusFileList)
         events.bind('oauth.auth_callback.after', name, _saveGlobusToken)
         # TODO folder rootpath
@@ -211,6 +239,9 @@ class GirderPlugin(plugin.GirderPlugin):
         # TODO file download
         # TODO item download
 
-        Globus._AUTH_SCOPES.append('urn:globus:auth:scope:transfer.api.globus.org:all')
+        Globus._AUTH_SCOPES += [
+            'urn:globus:auth:scope:transfer.api.globus.org:all',
+            'urn:globus:auth:scope:dabdceba-6d04-11e5-ba46-22000b92c6ec.e.globus.org:all'  # doesn't work...
+        ]
 
         # TODO change access_type from 'online' to 'offline' to get a refresh token
