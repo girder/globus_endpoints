@@ -11,8 +11,6 @@ from girder.exceptions import RestException
 from girder.models.user import User
 from girder_oauth.providers import Globus
 
-_DOWNLOAD_URL = 'https://dabdceba-6d04-11e5-ba46-22000b92c6ec.e.globus.org/Girder/FSNTOA_000101_050012.nc'
-
 
 def _globusFolder(id, name, path):
     info = json.dumps({
@@ -56,7 +54,7 @@ def _item(info, f):
 
 
 def _globusTc(user):
-    authorizer = globus_sdk.AccessTokenAuthorizer(user['globusToken'])
+    authorizer = globus_sdk.AccessTokenAuthorizer(user['globusTransferToken'])
     return globus_sdk.TransferClient(authorizer=authorizer)
 
 
@@ -66,7 +64,7 @@ def _globusChildFolders(self, event):
     params = event.info['params']
     user = self.getCurrentUser()
 
-    if not user or 'parentId' not in params or 'globusToken' not in user:
+    if not user or 'parentId' not in params or 'globusTransferToken' not in user:
         return  # This is not a child listing request
 
     if params['parentId'].startswith('globus:'):
@@ -76,7 +74,7 @@ def _globusChildFolders(self, event):
         itr = _globusTc(user).operation_ls(info['id'], path=info['path'])
         folders = [_subFolder(info, f) for f in itr if f['type'] == 'dir']
         event.preventDefault().addResponse(folders)
-    elif user and str(user['_id']) == params['parentId'] and 'globusToken' in user:
+    elif user and str(user['_id']) == params['parentId'] and 'globusTransferToken' in user:
         # We're listing our own user folders, so we append globus endpoints
         tc = _globusTc(user)
         eps = [_endpointFolder(ep) for ep in tc.endpoint_search(filter_scope='shared-with-me')]  # TODO could also be 'my-endpoints'
@@ -90,7 +88,7 @@ def _globusChildItems(self, event):
     params = event.info['params']
     user = self.getCurrentUser()
 
-    if not user or 'folderId' not in params or 'globusToken' not in user:
+    if not user or 'folderId' not in params or 'globusTransferToken' not in user:
         return
 
     if params['folderId'].startswith('globus:'):
@@ -137,6 +135,7 @@ def _globusItemInfo(self, event):
             'globusPath': info['path']
         })
 
+
 @access.public
 @rest.boundHandler
 def _globusFileList(self, event):
@@ -177,7 +176,7 @@ def _globusFileDownload(self, event):
     path = info['path'][2:]  # TODO this strips the leading '~/', might need to be more robust
     r = requests.get(
         'https://%s.e.globus.org/%s' % (info['id'], path), stream=True, headers={
-            'Authorization': 'Bearer ' + self.getCurrentUser()['globusToken']
+            'Authorization': 'Bearer ' + self.getCurrentUser()['globusDownloadToken']
         })
     try:
         r.raise_for_status()
@@ -185,8 +184,16 @@ def _globusFileDownload(self, event):
         raise RestException(
             'Invalid response from Globus HTTPS download service (%s).' % r.status_code, code=502)
 
-    rest.setResponseHeader('Content-Length', r.headers['Content-Length'])
-    rest.setResponseHeader('Content-Type', r.headers['Content-Type'])
+    for h in {'Content-Length', 'Content-Type'}:
+        if h in r.headers:
+            rest.setResponseHeader(h, r.headers[h])
+
+    disp = event.info['params'].get('contentDisposition', 'attachment')
+    if disp == 'inline':
+        rest.setResponseHeader('Content-Disposition', 'inline')
+    else:
+        basename = posixpath.basename(path)
+        rest.setResponseHeader('Content-Disposition', 'attachment; filename="%s"' % basename)
 
     def stream():
         for chunk in r.iter_content(65536):
@@ -200,11 +207,10 @@ def _saveGlobusToken(event):
     if event.info['provider'] == Globus:
         transferToken = None
         downloadToken = None
-        import pprint; pprint.pprint(event.info['token'])  # TODO delete
         for other in event.info['token']['other_tokens']:
             if other.get('resource_server') == 'transfer.api.globus.org':
                 transferToken = other['access_token']
-            if other.get('resource_server') == 'e.globus.org':  # TODO is this right?
+            if other.get('resource_server') == 'petrel_https_server':  # TODO hardcoded
                 downloadToken = other['access_token']
 
         User().update({
@@ -212,7 +218,7 @@ def _saveGlobusToken(event):
         }, {
             '$set': {
                 'globusTransferToken': transferToken,
-                'globusDownloadtoken': downloadToken
+                'globusDownloadToken': downloadToken
             }
         }, multi=False)
 
@@ -241,7 +247,7 @@ class GirderPlugin(plugin.GirderPlugin):
 
         Globus._AUTH_SCOPES += [
             'urn:globus:auth:scope:transfer.api.globus.org:all',
-            'urn:globus:auth:scope:dabdceba-6d04-11e5-ba46-22000b92c6ec.e.globus.org:all'  # doesn't work...
+            'https://auth.globus.org/scopes/56ceac29-e98a-440a-a594-b41e7a084b62/all'  # petrel RS
         ]
 
         # TODO change access_type from 'online' to 'offline' to get a refresh token
