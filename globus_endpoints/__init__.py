@@ -103,6 +103,7 @@ def _globusFolderInfo(event):
     id = event.info['id']
     if id.startswith('globus:'):
         info = json.loads(base64.b64decode(id[7:]))
+        print(info['path'])
         name = posixpath.basename(info['path'])
         event.preventDefault().addResponse(_globusFolder(info['id'], name, info['path']))
 
@@ -223,6 +224,31 @@ def _saveGlobusToken(event):
         }, multi=False)
 
 
+@access.public
+@rest.boundHandler
+def _globusRootPath(self, event):
+    if not event.info['id'].startswith('globus:'):
+        return
+
+    info = json.loads(base64.b64decode(event.info['id'][7:]))
+    path = info['path'].split('/')[1:-1]
+    user = self.getCurrentUser()
+    folders = [{
+        'object': _globusFolder(info['id'], info['id'], '~'),
+        'type': 'folder'
+    }]
+    for el in path:
+        folders.append({
+            'type': 'folder',
+            'object': _globusFolder(info['id'], el, '/'.join(path))
+        })
+
+    event.preventDefault().addResponse([{
+        'type': 'user',
+        'object': User().filter(user, user)
+    }] + folders)
+
+
 class GirderPlugin(plugin.GirderPlugin):
     DISPLAY_NAME = 'Globus endpoints'
 
@@ -235,15 +261,13 @@ class GirderPlugin(plugin.GirderPlugin):
         events.bind('rest.get.folder.before', name, _globusChildFolders)
         events.bind('rest.get.folder/:id.before', name, _globusFolderInfo)
         events.bind('rest.get.folder/:id/details.before', name, _globusFolderDetails)
+        events.bind('rest.get.folder/:id/rootpath.before', name, _globusRootPath)
         events.bind('rest.get.item/:id.before', name, _globusItemInfo)
         events.bind('rest.get.item/:id/download.before', name, _globusFileDownload)
         events.bind('rest.get.item/:id/files.before', name, _globusFileList)
+        events.bind('rest.get.item/:id/rootpath.before', name, _globusRootPath)
         events.bind('oauth.auth_callback.after', name, _saveGlobusToken)
-        # TODO folder rootpath
-        # TODO item rootpath
         # TODO file GET
-        # TODO file download
-        # TODO item download
 
         Globus._AUTH_SCOPES += [
             'urn:globus:auth:scope:transfer.api.globus.org:all',
