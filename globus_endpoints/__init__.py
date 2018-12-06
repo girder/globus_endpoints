@@ -184,9 +184,9 @@ def _globusFileDownload(self, event):
         raise RestException(
             'Invalid response from Globus HTTPS download service (%s).' % r.status_code, code=502)
 
-    for h in {'Content-Length', 'Content-Type'}:
-        if h in r.headers:
-            rest.setResponseHeader(h, r.headers[h])
+    rest.setResponseHeader(
+        'Content-Type', r.headers.get('Content-Type', 'application/octet-stream'))
+    rest.setResponseHeader('Content-Length', r.headers.get('Content-Length', str(info['size'])))
 
     disp = event.info['params'].get('contentDisposition', 'attachment')
     if disp == 'inline':
